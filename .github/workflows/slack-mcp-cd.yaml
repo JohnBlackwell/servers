@@ -54,7 +54,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3.0.0
       - uses: docker/build-push-action@v5.1.0
         with:
-          context: "./src/slack"
+          context: "."
           file: "./src/slack/Dockerfile"
           push: true
           tags: ${{ steps.meta.outputs.tags }}
