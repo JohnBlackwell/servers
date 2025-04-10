@@ -1,53 +1,137 @@
-#!/usr/bin/env node
-import http from "http";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import {
-  type Tool,
-} from "@modelcontextprotocol/sdk/types.js";
+import express, { Request, Response } from "express";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { z } from "zod";
 
-// Type definitions for tool arguments
-interface ListChannelsArgs {
-  limit?: number;
-  cursor?: string;
+
+// -------------- Slack Client --------------
+class SlackClient {
+  private botHeaders: { Authorization: string; "Content-Type": string };
+
+  constructor(botToken: string) {
+    this.botHeaders = {
+      Authorization: `Bearer ${botToken}`,
+      "Content-Type": "application/json",
+    };
+  }
+
+  async getChannels(limit = 100, cursor?: string): Promise<any> {
+    const params = new URLSearchParams({
+      types: "public_channel",
+      exclude_archived: "true",
+      limit: Math.min(limit, 200).toString(),
+      team_id: process.env.SLACK_TEAM_ID || "",
+    });
+    if (cursor) {
+      params.append("cursor", cursor);
+    }
+
+    const response = await fetch(
+      `https://slack.com/api/conversations.list?${params}`,
+      { headers: this.botHeaders },
+    );
+    return response.json();
+  }
+
+  async postMessage(channel_id: string, text: string): Promise<any> {
+    const response = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: this.botHeaders,
+      body: JSON.stringify({ channel: channel_id, text }),
+    });
+    return response.json();
+  }
+
+  async postReply(
+    channel_id: string,
+    thread_ts: string,
+    text: string,
+  ): Promise<any> {
+    const response = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: this.botHeaders,
+      body: JSON.stringify({ channel: channel_id, thread_ts, text }),
+    });
+    return response.json();
+  }
+
+  async addReaction(
+    channel_id: string,
+    timestamp: string,
+    reaction: string,
+  ): Promise<any> {
+    const response = await fetch("https://slack.com/api/reactions.add", {
+      method: "POST",
+      headers: this.botHeaders,
+      body: JSON.stringify({ channel: channel_id, timestamp, name: reaction }),
+    });
+    return response.json();
+  }
+
+  async getChannelHistory(channel_id: string, limit = 10): Promise<any> {
+    const params = new URLSearchParams({
+      channel: channel_id,
+      limit: limit.toString(),
+    });
+    const response = await fetch(
+      `https://slack.com/api/conversations.history?${params}`,
+      { headers: this.botHeaders },
+    );
+    return response.json();
+  }
+
+  async getThreadReplies(channel_id: string, thread_ts: string): Promise<any> {
+    const params = new URLSearchParams({ channel: channel_id, ts: thread_ts });
+    const response = await fetch(
+      `https://slack.com/api/conversations.replies?${params}`,
+      { headers: this.botHeaders },
+    );
+    return response.json();
+  }
+
+  async getUsers(limit = 100, cursor?: string): Promise<any> {
+    const params = new URLSearchParams({
+      limit: Math.min(limit, 200).toString(),
+      team_id: process.env.SLACK_TEAM_ID || "",
+    });
+    if (cursor) {
+      params.append("cursor", cursor);
+    }
+
+    const response = await fetch(`https://slack.com/api/users.list?${params}`, {
+      headers: this.botHeaders,
+    });
+    return response.json();
+  }
+
+  async getUserProfile(user_id: string): Promise<any> {
+    const params = new URLSearchParams({
+      user: user_id,
+      include_labels: "true",
+    });
+    const response = await fetch(
+      `https://slack.com/api/users.profile.get?${params}`,
+      { headers: this.botHeaders },
+    );
+    return response.json();
+  }
 }
 
-interface PostMessageArgs {
-  channel_id: string;
-  text: string;
+// -------------- Ensure we have required env vars --------------
+const botToken = process.env.SLACK_BOT_TOKEN;
+const teamId = process.env.SLACK_TEAM_ID;
+
+if (!botToken || !teamId) {
+  throw new Error(
+    "Please set SLACK_BOT_TOKEN and SLACK_TEAM_ID environment variables",
+  );
 }
 
-interface ReplyToThreadArgs {
-  channel_id: string;
-  thread_ts: string;
-  text: string;
-}
+// Instantiate Slack client
+const slackClient = new SlackClient(botToken);
 
-interface AddReactionArgs {
-  channel_id: string;
-  timestamp: string;
-  reaction: string;
-}
-
-interface GetChannelHistoryArgs {
-  channel_id: string;
-  limit?: number;
-}
-
-interface GetThreadRepliesArgs {
-  channel_id: string;
-  thread_ts: string;
-}
-
-interface GetUsersArgs {
-  cursor?: string;
-  limit?: number;
-}
-
-interface GetUserProfileArgs {
-  user_id: string;
-}
-
-// Tool definitions
+// -------------- Tool Definitions --------------
 const listChannelsTool: Tool = {
   name: "slack_list_channels",
   description: "List public channels in the workspace with pagination",
@@ -99,7 +183,8 @@ const replyToThreadTool: Tool = {
       },
       thread_ts: {
         type: "string",
-        description: "The timestamp of the parent message in the format '1234567890.123456'. Timestamps in the format without the period can be converted by adding the period such that 6 numbers come after it.",
+        description:
+          "Timestamp of the parent message in the format '1234567890.123456'",
       },
       text: {
         type: "string",
@@ -165,7 +250,8 @@ const getThreadRepliesTool: Tool = {
       },
       thread_ts: {
         type: "string",
-        description: "The timestamp of the parent message in the format '1234567890.123456'. Timestamps in the format without the period can be converted by adding the period such that 6 numbers come after it.",
+        description:
+          "Timestamp of the parent message in the format '1234567890.123456'",
       },
     },
     required: ["channel_id", "thread_ts"],
@@ -175,7 +261,7 @@ const getThreadRepliesTool: Tool = {
 const getUsersTool: Tool = {
   name: "slack_get_users",
   description:
-    "Get a list of all users in the workspace with their basic profile information",
+    "Get a list of all users in the workspace with basic profile information",
   inputSchema: {
     type: "object",
     properties: {
@@ -207,280 +293,123 @@ const getUserProfileTool: Tool = {
   },
 };
 
-class SlackClient {
-  private botHeaders: { Authorization: string; "Content-Type": string };
+// -------------- Instantiate MCP server --------------
+const server = new McpServer({
+  name: "example-server",
+  version: "1.0.0"
+});
 
-  constructor(botToken: string) {
-    this.botHeaders = {
-      Authorization: `Bearer ${botToken}`,
-      "Content-Type": "application/json",
+
+// -------------- Register Tools --------------
+
+server.tool(
+  "slack_list_channels",
+  new ResourceTemplateSchema("")
+  z.object({
+    limit: z.number().default(100),
+    cursor: z.string().optional(),
+  }),
+  async ({ limit, cursor }) => {
+    // Call your Slack client
+    const responseContent = await slackClient.getChannels(limit, cursor);
+
+    // Return the result in the standard "content" format
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(responseContent),
+        },
+      ],
     };
   }
+);
 
-  async getChannels(limit: number = 100, cursor?: string): Promise<any> {
-    const params = new URLSearchParams({
-      types: "public_channel",
-      exclude_archived: "true",
-      limit: Math.min(limit, 200).toString(),
-      team_id: process.env.SLACK_TEAM_ID!,
-    });
+// server.addTool(postMessageTool, async (invocation) => {
+//   const { channel_id, text } = invocation.input as {
+//     channel_id: string;
+//     text: string;
+//   };
+//   return slackClient.postMessage(channel_id, text);
+// });
 
-    if (cursor) {
-      params.append("cursor", cursor);
-    }
+// server.addTool(replyToThreadTool, async (invocation) => {
+//   const { channel_id, thread_ts, text } = invocation.input as {
+//     channel_id: string;
+//     thread_ts: string;
+//     text: string;
+//   };
+//   return slackClient.postReply(channel_id, thread_ts, text);
+// });
 
-    const response = await fetch(
-      `https://slack.com/api/conversations.list?${params}`,
-      { headers: this.botHeaders },
-    );
+// server.addTool(addReactionTool, async (invocation) => {
+//   const { channel_id, timestamp, reaction } = invocation.input as {
+//     channel_id: string;
+//     timestamp: string;
+//     reaction: string;
+//   };
+//   return slackClient.addReaction(channel_id, timestamp, reaction);
+// });
 
-    return response.json();
-  }
+// server.addTool(getChannelHistoryTool, async (invocation) => {
+//   const { channel_id, limit } = invocation.input as {
+//     channel_id: string;
+//     limit?: number;
+//   };
+//   return slackClient.getChannelHistory(channel_id, limit);
+// });
 
-  async postMessage(channel_id: string, text: string): Promise<any> {
-    const response = await fetch("https://slack.com/api/chat.postMessage", {
-      method: "POST",
-      headers: this.botHeaders,
-      body: JSON.stringify({
-        channel: channel_id,
-        text: text,
-      }),
-    });
+// server.addTool(getThreadRepliesTool, async (invocation) => {
+//   const { channel_id, thread_ts } = invocation.input as {
+//     channel_id: string;
+//     thread_ts: string;
+//   };
+//   return slackClient.getThreadReplies(channel_id, thread_ts);
+// });
 
-    return response.json();
-  }
+// server.addTool(getUsersTool, async (invocation) => {
+//   const { limit, cursor } = invocation.input as {
+//     limit?: number;
+//     cursor?: string;
+//   };
+//   return slackClient.getUsers(limit, cursor);
+// });
 
-  async postReply(
-    channel_id: string,
-    thread_ts: string,
-    text: string,
-  ): Promise<any> {
-    const response = await fetch("https://slack.com/api/chat.postMessage", {
-      method: "POST",
-      headers: this.botHeaders,
-      body: JSON.stringify({
-        channel: channel_id,
-        thread_ts: thread_ts,
-        text: text,
-      }),
-    });
+// server.addTool(getUserProfileTool, async (invocation) => {
+//   const { user_id } = invocation.input as {
+//     user_id: string;
+//   };
+//   return slackClient.getUserProfile(user_id);
+// });
 
-    return response.json();
-  }
+// -------------- Express / SSE Setup --------------
+const app = express();
+app.use(express.json());
 
-  async addReaction(
-    channel_id: string,
-    timestamp: string,
-    reaction: string,
-  ): Promise<any> {
-    const response = await fetch("https://slack.com/api/reactions.add", {
-      method: "POST",
-      headers: this.botHeaders,
-      body: JSON.stringify({
-        channel: channel_id,
-        timestamp: timestamp,
-        name: reaction,
-      }),
-    });
+// For multiple simultaneous connections, map from sessionId to SSE transport
+const transports: { [sessionId: string]: SSEServerTransport } = {};
 
-    return response.json();
-  }
-
-  async getChannelHistory(
-    channel_id: string,
-    limit: number = 10,
-  ): Promise<any> {
-    const params = new URLSearchParams({
-      channel: channel_id,
-      limit: limit.toString(),
-    });
-
-    const response = await fetch(
-      `https://slack.com/api/conversations.history?${params}`,
-      { headers: this.botHeaders },
-    );
-
-    return response.json();
-  }
-
-  async getThreadReplies(channel_id: string, thread_ts: string): Promise<any> {
-    const params = new URLSearchParams({
-      channel: channel_id,
-      ts: thread_ts,
-    });
-
-    const response = await fetch(
-      `https://slack.com/api/conversations.replies?${params}`,
-      { headers: this.botHeaders },
-    );
-
-    return response.json();
-  }
-
-  async getUsers(limit: number = 100, cursor?: string): Promise<any> {
-    const params = new URLSearchParams({
-      limit: Math.min(limit, 200).toString(),
-      team_id: process.env.SLACK_TEAM_ID!,
-    });
-
-    if (cursor) {
-      params.append("cursor", cursor);
-    }
-
-    const response = await fetch(`https://slack.com/api/users.list?${params}`, {
-      headers: this.botHeaders,
-    });
-
-    return response.json();
-  }
-
-  async getUserProfile(user_id: string): Promise<any> {
-    const params = new URLSearchParams({
-      user: user_id,
-      include_labels: "true",
-    });
-
-    const response = await fetch(
-      `https://slack.com/api/users.profile.get?${params}`,
-      { headers: this.botHeaders },
-    );
-
-    return response.json();
-  }
-}
-
-async function main() {
-  const botToken = process.env.SLACK_BOT_TOKEN;
-  const teamId = process.env.SLACK_TEAM_ID;
-
-  if (!botToken || !teamId) {
-    console.error(
-      "Please set SLACK_BOT_TOKEN and SLACK_TEAM_ID environment variables",
-    );
-    process.exit(1);
-  }
-
-  console.error("Starting Slack MCP HTTP Server...");
-
-  const slackClient = new SlackClient(botToken);
-  const server = new Server(
-    { name: "Slack MCP HTTP Server", version: "1.0.0" },
-    { capabilities: { tools: {} } }
-  );
-  
-  const requestHandler = async (req: http.IncomingMessage, res: http.ServerResponse) => {
-    if (req.method !== "POST") {
-      res.writeHead(405, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Method not allowed" }));
-      return;
-    }
-
-    let body = "";
-    req.on("data", chunk => {
-      body += chunk.toString();
-    });
-
-    req.on("end", async () => {
-      try {
-        const requestData = JSON.parse(body);
-
-        if (requestData.type === "ListToolsRequest") {
-          console.error("Received ListToolsRequest");
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ tools: [listChannelsTool, postMessageTool, replyToThreadTool, addReactionTool, getChannelHistoryTool, getThreadRepliesTool, getUsersTool, getUserProfileTool] }));
-        } else if (requestData.type === "CallToolRequest") {
-          console.error("Received CallToolRequest:", requestData);
-
-          if (!requestData.params || !requestData.params.name) {
-            throw new Error("Invalid request: Missing tool name");
-          }
-
-          let responseContent;
-          switch (requestData.params.name) {
-            case "slack_list_channels":
-              const listArgs = requestData.params.arguments as ListChannelsArgs;
-              responseContent = await slackClient.getChannels(listArgs.limit, listArgs.cursor);
-              break;
-
-            case "slack_post_message":
-              const postArgs = requestData.params.arguments as PostMessageArgs;
-              if (!postArgs.channel_id || !postArgs.text) {
-                throw new Error("Missing required arguments: channel_id or text");
-              }
-              responseContent = await slackClient.postMessage(postArgs.channel_id, postArgs.text);
-              break;
-
-            case "slack_reply_to_thread":
-              const threadArgs = requestData.params.arguments as ReplyToThreadArgs;
-              if (!threadArgs.channel_id || !threadArgs.thread_ts || !threadArgs.text) {
-                throw new Error("Missing required arguments: channel_id or thread timestamp or text")
-              }
-              responseContent = await slackClient.postReply(threadArgs.channel_id, threadArgs.thread_ts, threadArgs.text)
-              break;
-
-            case "slack_get_channel_history":
-              const historyArgs = requestData.params.arguments as GetChannelHistoryArgs;
-              if (!historyArgs.channel_id) {
-                throw new Error("Missing required arguments: channel_id");
-              }
-              responseContent = await slackClient.getChannelHistory(historyArgs.channel_id, historyArgs.limit);
-              break;
-            
-            case "slack_add_reaction":
-              const reactionArgs = requestData.params.arguments as AddReactionArgs;
-              if (!reactionArgs.channel_id || !reactionArgs.timestamp || !reactionArgs.reaction) {
-                throw new Error("Missing required arguments: channel_id or timestamp or reaction")
-              }
-              responseContent = await slackClient.addReaction(reactionArgs.channel_id, reactionArgs.timestamp, reactionArgs.reaction)
-              break;
-            
-            case "slack_get_thread_replies":
-              const threadRepliesArgs = requestData.params.arguments as GetThreadRepliesArgs;
-              if (!threadRepliesArgs.channel_id || !threadRepliesArgs.thread_ts) {
-                throw new Error("Missing required arguments: channel_id or timestamp")
-              }
-              responseContent = await slackClient.getThreadReplies(threadRepliesArgs.channel_id, threadRepliesArgs.thread_ts)
-              break;
-
-            case "slack_get_users":
-              const userArgs = requestData.params.arguments as GetUsersArgs;
-              responseContent = await slackClient.getUsers(userArgs.limit, userArgs.cursor)
-              break;
-
-            case "slack_get_user_profile":
-              const profileArgs = requestData.params.arguments as GetUserProfileArgs;
-              if (!profileArgs.user_id) {
-                throw new Error("Missing required argument: user_id")
-              }
-              responseContent = await slackClient.getUserProfile(profileArgs.user_id)
-              break;
-
-            default:
-              throw new Error(`Unknown tool: ${requestData.params.name}`);
-          }
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ content: [{ type: "text", text: JSON.stringify(responseContent) }] }));
-        } else {
-          throw new Error("Invalid request type");
-        }
-      } catch (error) {
-        console.error("Error handling request:", error);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
-      }
-    });
-  };
-
-  const httpServer = http.createServer(requestHandler);
-  const PORT = process.env.PORT || 3000;
-
-  httpServer.listen(PORT, () => {
-    console.error(`Slack MCP HTTP Server running on port ${PORT}`);
+app.get("/sse", async (_: Request, res: Response) => {
+  const transport = new SSEServerTransport("/messages", res);
+  transports[transport.sessionId] = transport;
+  res.on("close", () => {
+    delete transports[transport.sessionId];
   });
-}
+  await server.connect(transport);
+});
 
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
-  process.exit(1);
+app.post("/messages", async (req: Request, res: Response) => {
+  const sessionId = req.query.sessionId as string;
+  const transport = transports[sessionId];
+  if (transport) {
+    await transport.handlePostMessage(req, res);
+  } else {
+    res.status(400).send("No transport found for sessionId");
+  }
+});
+
+// -------------- Start the server --------------
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`Slack MCP Server running on port ${PORT}`);
 });
